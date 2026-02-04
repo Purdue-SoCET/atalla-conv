@@ -139,7 +139,7 @@ class ImplicitIm2colSystolicSim:
 
         return self.ofmap, logs
 
-    def simulate_systolic(self, trace=True):
+    def simulate_systolic(self, trace=True, max_logs=None):
         """
         Functional systolic timing:
         - Row i input arrives at time i (skewed injection).
@@ -193,8 +193,9 @@ class ImplicitIm2colSystolicSim:
                                 tile_inputs.append(input_vec[:cfg.C].tolist())
                                 tile_weights.append(wt[:cfg.C, :cfg.K].tolist())
 
+                            do_log = trace and (max_logs is None or len(logs) < max_logs)
                             timeline = []
-                            if trace:
+                            if do_log:
                                 running = [np.zeros((kout_limit,), dtype=float) for _ in tile_partials]
                                 for t in range(cfg.array_size):
                                     row_inputs = [0.0] * cfg.array_size
