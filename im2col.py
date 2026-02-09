@@ -19,12 +19,6 @@ class SimConfig:
 
 
 class ImplicitIm2colSystolicSim:
-    """
-    Channel-first implicit im2col simulation with systolic-array mapping.
-    HWC layout: each input "word" is all channels for one pixel (h, w).
-    Each (r, s) kernel position is a CxK 1x1 GEMM.
-    """
-
     def __init__(self, cfg: SimConfig, ifmap=None, weights=None):
         self.cfg = cfg
         self._validate()
@@ -104,48 +98,7 @@ class ImplicitIm2colSystolicSim:
             return padded
         return word[: cfg.array_size]
 
-    def simulate(self, trace=True):
-        cfg = self.cfg
-        padded_ifmap = self._pad_ifmap()
-        logs = []
-
-        for r in range(cfg.R):
-            for s in range(cfg.S):
-                wt = self.weight_tile(r, s)
-                cin_limit = min(cfg.C, cfg.array_size)
-                kout_limit = min(cfg.K, cfg.array_size)
-
-                for n in range(cfg.N):
-                    for oh in range(self.Ho):
-                        for ow in range(self.Wo):
-                            ih = oh * cfg.stride + r
-                            iw = ow * cfg.stride + s
-                            input_vec = self.input_word(padded_ifmap, n, ih, iw)
-                            partial = input_vec[:cin_limit] @ wt[:cin_limit, :kout_limit]
-                            self.ofmap[n, oh, ow, :kout_limit] += partial
-
-                            if trace:
-                                logs.append(
-                                    {
-                                        "tile_rs": (r, s),
-                                        "n": n,
-                                        "out_hw": (oh, ow),
-                                        "in_hw": (ih, iw),
-                                        "weight_tile": wt[:cfg.C, :cfg.K].tolist(),
-                                        "input_word": input_vec[:cfg.C].tolist(),
-                                        "partial_sum": partial.tolist(),
-                                    }
-                                )
-
-        return self.ofmap, logs
-
     def simulate_systolic(self, trace=True, max_logs=None):
-        """
-        Functional systolic timing:
-        - Row i input arrives at time i (skewed injection).
-        - Output becomes ready after (cin_limit - 1) + (array_size - 1).
-        This does not model memory or exact cycle counts, only dataflow order.
-        """
         cfg = self.cfg
         self.ofmap = np.zeros((cfg.N, self.Ho, self.Wo, cfg.K), dtype=float)
         padded_ifmap = self._pad_ifmap()
@@ -257,15 +210,16 @@ def direct_conv_hwc(ifmap, weights, stride=1, pad=0):
 
 
 def main():
+    # set config constraints here
     cfg = SimConfig(
-        N=1,
-        H=4,
-        W=4,
-        C=3,
-        K=2,
-        R=2,
-        S=2,
-        array_size=4,
+        N=1, # batches
+        H=4, # height of IFmap
+        W=4, # width of IFmap
+        C=3, # channels of IFmap
+        K=2, # number of kernels
+        R=2, # height of kernel
+        S=2, # width of kernel 
+        array_size=4, # systolic array width / height
         stride=1,
         pad=0,
         use_sequential_init=True,
@@ -281,7 +235,7 @@ def main():
     unfolded = sim.explicit_im2col_channel_first()
     print(unfolded)
 
-    ofmap, logs = sim.simulate_systolic(trace=True)
+    ofmap, logs = sim.simulate_systolic(trace=True, max_logs=8)
     print("\nIteration logs (systolic-timed, packed):")
     for i, entry in enumerate(logs):
         print(f"iter={i} tiles={entry['tile_rs_group']} out={entry['out_hw']}")

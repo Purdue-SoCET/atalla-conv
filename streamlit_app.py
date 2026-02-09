@@ -14,7 +14,7 @@ def _list_to_df(rows, columns=None):
 
 
 st.set_page_config(page_title="Implicit Im2col Systolic Sim", layout="wide")
-st.title("Implicit Im2col (Channel-First) Systolic Simulation")
+#st.title("Implicit Im2col (Channel-First) Systolic Simulation")
 
 with st.sidebar:
     st.header("Config")

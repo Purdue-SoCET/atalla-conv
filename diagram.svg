@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360">
+  <style>
+    .box { fill:#f7f7f7; stroke:#333; stroke-width:1.5; }
+    .label { font: 14px sans-serif; fill:#111; }
+    .small { font: 12px sans-serif; fill:#333; }
+    .arrow { stroke:#333; stroke-width:1.5; marker-end:url(#arrow); }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333"/>
+    </marker>
+  </defs>
+
+  <rect class="box" x="20" y="40" width="170" height="70" rx="6"/>
+  <text class="label" x="35" y="70">IFMap (HWC)</text>
+  <text class="small" x="35" y="92">N x H x W x C</text>
+
+  <rect class="box" x="240" y="40" width="170" height="70" rx="6"/>
+  <text class="label" x="255" y="70">Kernel (R,S)</text>
+  <text class="small" x="255" y="92">R x S x C x K</text>
+
+  <rect class="box" x="240" y="140" width="170" height="70" rx="6"/>
+  <text class="label" x="255" y="170">Decompose</text>
+  <text class="small" x="255" y="192">R*S tiles of 1x1</text>
+
+  <rect class="box" x="460" y="140" width="190" height="70" rx="6"/>
+  <text class="label" x="475" y="170">Weight Tile</text>
+  <text class="small" x="475" y="192">C x K (packed)</text>
+
+  <rect class="box" x="460" y="40" width="190" height="70" rx="6"/>
+  <text class="label" x="475" y="70">HWC Word</text>
+  <text class="small" x="475" y="92">per (h,w), C vals</text>
+
+  <rect class="box" x="690" y="80" width="190" height="90" rx="6"/>
+  <text class="label" x="705" y="115">Systolic Array</text>
+  <text class="small" x="705" y="138">row-skewed input</text>
+  <text class="small" x="705" y="158">partial sums</text>
+
+  <rect class="box" x="690" y="220" width="190" height="70" rx="6"/>
+  <text class="label" x="705" y="250">OFMap (HWC)</text>
+  <text class="small" x="705" y="272">N x Ho x Wo x K</text>
+
+  <line class="arrow" x1="190" y1="75" x2="240" y2="75"/>
+  <line class="arrow" x1="325" y1="110" x2="325" y2="140"/>
+  <line class="arrow" x1="410" y1="175" x2="460" y2="175"/>
+  <line class="arrow" x1="410" y1="75" x2="460" y2="75"/>
+  <line class="arrow" x1="650" y1="75" x2="690" y2="110"/>
+  <line class="arrow" x1="650" y1="175" x2="690" y2="140"/>
+  <line class="arrow" x1="785" y1="170" x2="785" y2="220"/>
+</svg>
