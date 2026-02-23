@@ -2,7 +2,7 @@
 ![diagram](diagram.svg)
 - Systolic array size fixed at **32×32** (Atalla). **Mapping: K-rows / C_out-cols** (inference-optimized).
 - IFMap HWC → channel-first im2col → GEMM (M,K)@(K,N). **K-tiling** (rows) and **N-tiling** (cols) in 32×32 blocks; **output spatial tiling** (M streamed in tiles). **Padding** (pad=0,1,2,…) verified vs direct conv.
-- Streamlit: systolic array movement (weight tile, input row, psum row with colorbars + short legend) and **psum writeback** (which OFMap cell and channel slice get accumulated). See [STREAMLIT_WALKTHROUGH.md](STREAMLIT_WALKTHROUGH.md).
+- Streamlit: systolic array movement (weight tile, input row, psum row with colorbars + short legend) and **psum writeback** (which OFMap cell and channel slice get accumulated).
 
 ## Run
 CLI:
