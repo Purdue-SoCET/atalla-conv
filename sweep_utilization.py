@@ -76,7 +76,7 @@ def main():
     # Util vs C_out
     ax = axes[0, 0]
     x, u = sweep_cout()
-    ax.plot(x, [v * 100 for v in u], "o-")
+    ax.plot(x, [v * 100 for v in u], "o-", color="green")
     ax.set_xlabel("C_out (K)")
     ax.set_ylabel("Utilization (%)")
     ax.set_title("Util vs C_out (fixed C=64, 3×3)")
@@ -87,7 +87,7 @@ def main():
     # Util vs C_in
     ax = axes[0, 1]
     x, u = sweep_cin()
-    ax.plot(x, [v * 100 for v in u], "o-")
+    ax.plot(x, [v * 100 for v in u], "o-", color="green")
     ax.set_xlabel("C_in (C)")
     ax.set_ylabel("Utilization (%)")
     ax.set_title("Util vs C_in (fixed K=64, 3×3)")
@@ -98,7 +98,7 @@ def main():
     ax = axes[0, 2]
     x, u = sweep_n()
     util_n = u[0] * 100
-    ax.plot(x, [v * 100 for v in u], "o-")
+    ax.plot(x, [v * 100 for v in u], "o-", color="green")
     ax.set_xlabel("Batch size (N)")
     ax.set_ylabel("Utilization (%)")
     ax.set_title(f"Util vs N (flat at {util_n:.1f}% — M cancels)")
@@ -111,8 +111,8 @@ def main():
     labels, u64, u2 = sweep_kernel_size_two_configs()
     x = np.arange(len(labels))
     w = 0.35
-    ax.bar(x - w / 2, u64, w, label="C=64, K=64", color="steelblue", edgecolor="black")
-    ax.bar(x + w / 2, u2, w, label="C=2, K=2", color="coral", edgecolor="black")
+    ax.bar(x - w / 2, u64, w, label="C=64, K=64", color="green", alpha=0.8, edgecolor="black")
+    ax.bar(x + w / 2, u2, w, label="C=2, K=2", color="gold", edgecolor="black")
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_xlabel("Kernel R×S")
@@ -127,7 +127,7 @@ def main():
     ax = axes[1, 1]
     x, u = sweep_ifmap_size()
     util_hw = u[0] * 100
-    ax.plot(x, [v * 100 for v in u], "o-")
+    ax.plot(x, [v * 100 for v in u], "o-", color="green")
     ax.set_xlabel("IFMap H=W")
     ax.set_ylabel("Utilization (%)")
     ax.set_title(f"Util vs IFMap size (flat at {util_hw:.1f}% — M cancels)")
@@ -145,7 +145,7 @@ def main():
             cfg = SimConfig(N=1, H=56, W=56, C=c, K=k, R=3, S=3, stride=1, pad=0)
             u, _, _ = utilization_k_rows_n_cols(cfg)
             grid[i, j] = u * 100
-    im = ax.imshow(grid, cmap="viridis", vmin=0, vmax=100, aspect="auto")
+    im = ax.imshow(grid, cmap="Greens", vmin=0, vmax=100, aspect="auto")
     ax.set_xticks(range(len(c_out_vals)))
     ax.set_yticks(range(len(c_in_vals)))
     ax.set_xticklabels(c_out_vals)
