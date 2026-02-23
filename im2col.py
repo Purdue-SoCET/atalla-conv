@@ -1,6 +1,17 @@
 from dataclasses import dataclass
 import numpy as np
 
+# Atalla fixed 32×32 systolic array.
+SYSTOLIC_ARRAY_SIZE = 32
+
+"""
+Tiling (32×32 array, inference mapping = K-rows / C_out-cols):
+- Kernel (K) tiling: rows tile in chunks of 32 (k_start, k_end).
+- Output-channel (N/C_out) tiling: cols tile in chunks of 32 (n_start, n_end).
+- Output spatial tiling: M = N*Ho*Wo streamed in tiles of SPATIAL_TILE_SIZE to structure reuse.
+"""
+SPATIAL_TILE_SIZE = 32  # output positions per spatial tile (same kernel reused)
+
 
 @dataclass
 class SimConfig:
@@ -11,11 +22,15 @@ class SimConfig:
     K: int
     R: int
     S: int
-    array_size: int
     stride: int = 1
     pad: int = 0
     seed: int = 0
     use_sequential_init: bool = True
+    """If True: fill IFMap/weights with 0,1,2,... for deterministic debugging. If False: random integers from seed."""
+
+    @property
+    def array_size(self) -> int:
+        return SYSTOLIC_ARRAY_SIZE
 
 
 class ImplicitIm2colSystolicSim:
@@ -50,8 +65,6 @@ class ImplicitIm2colSystolicSim:
 
     def _validate(self):
         cfg = self.cfg
-        if cfg.array_size <= 0 or cfg.array_size != int(cfg.array_size):
-            raise ValueError("array_size must be a positive integer.")
         if cfg.H + 2 * cfg.pad < cfg.R or cfg.W + 2 * cfg.pad < cfg.S:
             raise ValueError("Kernel larger than padded input.")
         if cfg.stride <= 0:
@@ -98,93 +111,214 @@ class ImplicitIm2colSystolicSim:
             return padded
         return word[: cfg.array_size]
 
-    def simulate_systolic(self, trace=True, max_logs=None):
+    def _receptive_flat(self, padded_ifmap, n, oh, ow):
+        """Receptive field at (oh, ow) for batch n, flattened in (r,s,c) order. Shape (R*S*C,)."""
+        cfg = self.cfg
+        out = np.zeros((cfg.R * cfg.S * cfg.C,), dtype=float)
+        for r in range(cfg.R):
+            for s in range(cfg.S):
+                ih, iw = oh * cfg.stride + r, ow * cfg.stride + s
+                idx = r * cfg.S * cfg.C + s * cfg.C
+                out[idx : idx + cfg.C] = padded_ifmap[n, ih, iw, :]
+        return out
+
+    def simulate(self, trace=True, max_logs=None, mapping=None):
+        """
+        Run convolution on 32×32 array. Default: k_rows_n_cols (inference-optimized).
+        Pass mapping='batch_parallel' to use batch-parallel columns. Returns ofmap, step_logs, util_stats.
+        """
+        if mapping is None:
+            mapping = "k_rows_n_cols"
+        if mapping == "k_rows_n_cols":
+            return self.simulate_k_rows_n_cols(trace=trace, max_logs=max_logs)
+        return self._simulate_batch_parallel(trace, max_logs)
+
+    def _simulate_batch_parallel(self, trace=True, max_logs=None):
+        """Rows = kernel dims, cols = batch. Best when N is large."""
         cfg = self.cfg
         self.ofmap = np.zeros((cfg.N, self.Ho, self.Wo, cfg.K), dtype=float)
         padded_ifmap = self._pad_ifmap()
-        logs = []
+        kernel_flatten = cfg.R * cfg.S * cfg.C
+        batch_tile = min(cfg.N, cfg.array_size)
+        step_logs = []
+        total_pe_cycles = 0
+        total_possible_pe_cycles = 0
 
-        cin_limit = min(cfg.C, cfg.array_size)
-        kout_limit = min(cfg.K, cfg.array_size)
-        tiles_per_pack = max(1, min(cfg.array_size // max(cfg.C, 1), cfg.S))
+        for oh in range(self.Ho):
+            for ow in range(self.Wo):
+                for k in range(cfg.K):
+                    kernel_flat = self.weights[:, :, :, k].flatten()
+                    for batch_start in range(0, cfg.N, batch_tile):
+                        batch_end = min(batch_start + batch_tile, cfg.N)
+                        n_batch = batch_end - batch_start
+                        for row_start in range(0, kernel_flatten, cfg.array_size):
+                            row_end = min(row_start + cfg.array_size, kernel_flatten)
+                            n_rows = row_end - row_start
+                            total_possible_pe_cycles += cfg.array_size * cfg.array_size
 
-        for r in range(cfg.R):
-            for s_base in range(0, cfg.S, tiles_per_pack):
-                group_s = list(range(s_base, min(s_base + tiles_per_pack, cfg.S)))
-                packed_weight = np.zeros((cfg.array_size, cfg.array_size), dtype=float)
+                            W_block = np.zeros((cfg.array_size, cfg.array_size), dtype=float)
+                            W_block[:n_rows, :n_batch] = np.broadcast_to(
+                                kernel_flat[row_start:row_end, None], (n_rows, n_batch)
+                            )
+                            A_block = np.zeros((cfg.array_size, cfg.array_size), dtype=float)
+                            for j, n in enumerate(range(batch_start, batch_end)):
+                                rf = self._receptive_flat(padded_ifmap, n, oh, ow)
+                                A_block[:n_rows, j] = rf[row_start:row_end]
 
-                for t_idx, s in enumerate(group_s):
-                    row_base = t_idx * cfg.C
-                    if row_base >= cfg.array_size:
-                        break
-                    packed_weight[row_base:row_base + cin_limit, :kout_limit] = self.weights[
-                        r, s, :cin_limit, :kout_limit
-                    ]
+                            partial = np.zeros((n_batch,), dtype=float)
+                            for j in range(n_batch):
+                                partial[j] = float(np.dot(A_block[:n_rows, j], W_block[:n_rows, j]))
 
-                for n in range(cfg.N):
-                    for oh in range(self.Ho):
-                        for ow in range(self.Wo):
-                            packed_input = np.zeros((cfg.array_size,), dtype=float)
-                            tile_partials = []
-                            tile_inputs = []
-                            tile_weights = []
+                            for j, n in enumerate(range(batch_start, batch_end)):
+                                self.ofmap[n, oh, ow, k] += partial[j]
 
-                            for t_idx, s in enumerate(group_s):
-                                row_base = t_idx * cfg.C
-                                if row_base >= cfg.array_size:
-                                    break
-                                ih = oh * cfg.stride + r
-                                iw = ow * cfg.stride + s
-                                input_vec = self.input_word(padded_ifmap, n, ih, iw)
-                                packed_input[row_base:row_base + cin_limit] = input_vec[:cin_limit]
+                            active_pe = n_rows * n_batch
+                            total_pe_cycles += active_pe
+                            pe_util = active_pe / (cfg.array_size * cfg.array_size)
 
-                                wt = self.weights[r, s, :cin_limit, :kout_limit]
-                                partial = input_vec[:cin_limit] @ wt
-                                self.ofmap[n, oh, ow, :kout_limit] += partial
-
-                                tile_partials.append(partial.tolist())
-                                tile_inputs.append(input_vec[:cfg.C].tolist())
-                                tile_weights.append(wt[:cfg.C, :cfg.K].tolist())
-
-                            do_log = trace and (max_logs is None or len(logs) < max_logs)
-                            timeline = []
+                            do_log = trace and (max_logs is None or len(step_logs) < max_logs)
                             if do_log:
-                                running = [np.zeros((kout_limit,), dtype=float) for _ in tile_partials]
+                                running_psum = np.zeros((cfg.array_size,), dtype=float)
+                                timeline = []
                                 for t in range(cfg.array_size):
-                                    row_inputs = [0.0] * cfg.array_size
-                                    if t < cfg.array_size:
-                                        row_inputs[t] = float(packed_input[t])
+                                    row_in = [0.0] * cfg.array_size
+                                    if t < n_rows:
+                                        row_in[:n_batch] = A_block[t, :n_batch]
+                                        for j in range(n_batch):
+                                            running_psum[j] += A_block[t, j] * W_block[t, j]
+                                    timeline.append({
+                                        "t": t,
+                                        "row_inputs": row_in[:],
+                                        "partial_sums": running_psum.copy(),
+                                    })
+                                step_logs.append({
+                                    "oh": oh, "ow": ow, "k": k, "batch_start": batch_start, "row_start": row_start,
+                                    "n_rows": n_rows, "n_batch": n_batch,
+                                    "weight_block": W_block[:n_rows, :n_batch].copy(),
+                                    "input_block": A_block[:n_rows, :n_batch].copy(),
+                                    "partial_sums": partial.copy(),
+                                    "pe_util": pe_util,
+                                    "active_pe": active_pe,
+                                    "timeline": timeline,
+                                })
 
-                                    t_idx = t // cfg.C
-                                    row_in_tile = t - (t_idx * cfg.C)
-                                    if t_idx < len(tile_partials) and row_in_tile < cin_limit:
-                                        w_row = packed_weight[t, :kout_limit]
-                                        running[t_idx] += packed_input[t] * w_row
+        util_stats = {
+            "total_pe_cycles": total_pe_cycles,
+            "total_possible_pe_cycles": total_possible_pe_cycles,
+            "utilization": total_pe_cycles / total_possible_pe_cycles if total_possible_pe_cycles else 0,
+            "mapping": "batch_parallel",
+        }
+        return self.ofmap, step_logs, util_stats
 
-                                    timeline.append(
-                                        {
-                                            "t": t,
-                                            "row_inputs": row_inputs[:cfg.array_size],
-                                            "partial_sums": [r.tolist() for r in running],
-                                        }
-                                    )
+    def simulate_k_rows_n_cols(self, trace=True, max_logs=None):
+        """
+        K-rows, C_out-cols (weight-stationary). K tiling + N (C_out) tiling + output spatial tiling.
+        Rows = kernel dims, cols = output channels; M = N*Ho*Wo streamed in spatial tiles.
+        """
+        cfg = self.cfg
+        self.ofmap = np.zeros((cfg.N, self.Ho, self.Wo, cfg.K), dtype=float)
+        padded_ifmap = self._pad_ifmap()
+        K_flat = cfg.R * cfg.S * cfg.C
+        M = cfg.N * self.Ho * self.Wo
+        sz = cfg.array_size
+        step_logs = []
+        total_pe, total_possible = 0, 0
 
-                                logs.append(
-                                    {
-                                        "tile_rs_group": [(r, s) for s in group_s],
-                                        "n": n,
-                                        "out_hw": (oh, ow),
-                                        "weight_tiles": tile_weights,
-                                        "input_words": tile_inputs,
-                                        "packed_weight_tile": packed_weight[: cfg.array_size, : cfg.K].tolist(),
-                                        "packed_input": packed_input[:cfg.array_size].tolist(),
-                                        "partial_sums": tile_partials,
-                                        "output_ready_time": (cin_limit - 1) + (cfg.array_size - 1),
-                                        "timeline": timeline,
-                                    }
-                                )
+        for k_start in range(0, K_flat, sz):
+            k_end = min(k_start + sz, K_flat)
+            k_tile = k_end - k_start
+            for n_start in range(0, cfg.K, sz):
+                n_end = min(n_start + sz, cfg.K)
+                n_tile = n_end - n_start
+                W_tile = np.zeros((sz, sz), dtype=float)
+                W_block = self.weights[:, :, :, n_start:n_end].reshape(K_flat, -1)
+                W_tile[:k_tile, :n_tile] = W_block[k_start:k_end, :]
 
-        return self.ofmap, logs
+                for m_tile_start in range(0, M, SPATIAL_TILE_SIZE):
+                    m_tile_end = min(m_tile_start + SPATIAL_TILE_SIZE, M)
+                    for m in range(m_tile_start, m_tile_end):
+                        n_b = m // (self.Ho * self.Wo)
+                        oh = (m // self.Wo) % self.Ho
+                        ow = m % self.Wo
+                        rf = self._receptive_flat(padded_ifmap, n_b, oh, ow)
+                        in_row = np.zeros((sz,), dtype=float)
+                        in_row[:k_tile] = rf[k_start:k_end]
+                        out_row = in_row[:k_tile] @ W_tile[:k_tile, :n_tile]
+                        self.ofmap[n_b, oh, ow, n_start:n_end] += out_row
+
+                        total_pe += k_tile * n_tile
+                        total_possible += sz * sz
+
+                        do_log = trace and (max_logs is None or len(step_logs) < max_logs)
+                        if do_log and m == m_tile_start:
+                            row_inputs = [float(in_row[i]) if i < k_tile else np.nan for i in range(sz)]
+                            psum_pad = list(out_row) + [np.nan] * (sz - len(out_row))
+                            step_logs.append({
+                                "k_start": k_start, "n_start": n_start,
+                                "m": m, "n_b": n_b, "oh": oh, "ow": ow,
+                                "n_rows": k_tile, "n_batch": n_tile,
+                                "weight_block": W_tile[:k_tile, :n_tile].copy(),
+                                "input_block": in_row[:k_tile].reshape(-1, 1),
+                                "partial_sums": out_row.copy(),
+                                "pe_util": (k_tile * n_tile) / (sz * sz),
+                                "active_pe": k_tile * n_tile,
+                                "k": n_start,
+                                "timeline": [{"t": 0, "row_inputs": row_inputs, "partial_sums": psum_pad[:sz]}],
+                            })
+
+        util_stats = {
+            "total_pe_cycles": total_pe,
+            "total_possible_pe_cycles": total_possible,
+            "utilization": total_pe / total_possible if total_possible else 0,
+            "mapping": "k_rows_n_cols",
+        }
+        return self.ofmap, step_logs, util_stats
+
+
+def utilization_batch_parallel(cfg: SimConfig):
+    """PE utilization if we map rows=kernel, cols=batch. No sim, just math."""
+    K_flat = cfg.R * cfg.S * cfg.C
+    Ho = (cfg.H + 2 * cfg.pad - cfg.R) // cfg.stride + 1
+    Wo = (cfg.W + 2 * cfg.pad - cfg.S) // cfg.stride + 1
+    sz = SYSTOLIC_ARRAY_SIZE
+    total_pe, total_possible = 0, 0
+    for _oh in range(Ho):
+        for _ow in range(Wo):
+            for _k in range(cfg.K):
+                for batch_start in range(0, cfg.N, sz):
+                    n_batch = min(sz, cfg.N - batch_start)
+                    for row_start in range(0, K_flat, sz):
+                        n_rows = min(sz, K_flat - row_start)
+                        total_pe += n_rows * n_batch
+                        total_possible += sz * sz
+    return (total_pe / total_possible) if total_possible else 0, total_pe, total_possible
+
+
+def utilization_k_rows_n_cols(cfg: SimConfig):
+    """PE utilization if we map rows=kernel, cols=C_out (output channels). Standard WS. No sim."""
+    K_flat = cfg.R * cfg.S * cfg.C
+    Ho = (cfg.H + 2 * cfg.pad - cfg.R) // cfg.stride + 1
+    Wo = (cfg.W + 2 * cfg.pad - cfg.S) // cfg.stride + 1
+    M = cfg.N * Ho * Wo
+    N_out = cfg.K  # C_out
+    sz = SYSTOLIC_ARRAY_SIZE
+    total_pe, total_possible = 0, 0
+    for k_start in range(0, K_flat, sz):
+        k_tile = min(sz, K_flat - k_start)
+        for n_start in range(0, N_out, sz):
+            n_tile = min(sz, N_out - n_start)
+            total_pe += M * (k_tile * n_tile)
+            total_possible += M * (sz * sz)
+    return (total_pe / total_possible) if total_possible else 0, total_pe, total_possible
+
+
+def best_mapping(cfg: SimConfig):
+    """Return ('batch_parallel'|'k_rows_n_cols', util). Picks higher utilization."""
+    u_bp, _, _ = utilization_batch_parallel(cfg)
+    u_kn, _, _ = utilization_k_rows_n_cols(cfg)
+    if u_kn >= u_bp:
+        return "k_rows_n_cols", u_kn
+    return "batch_parallel", u_bp
 
 
 def direct_conv_hwc(ifmap, weights, stride=1, pad=0):
@@ -210,54 +344,16 @@ def direct_conv_hwc(ifmap, weights, stride=1, pad=0):
 
 
 def main():
-    # set config constraints here
-    cfg = SimConfig(
-        N=1, # batches
-        H=4, # height of IFmap
-        W=4, # width of IFmap
-        C=3, # channels of IFmap
-        K=2, # number of kernels
-        R=2, # height of kernel
-        S=2, # width of kernel 
-        array_size=4, # systolic array width / height
-        stride=1,
-        pad=0,
-        use_sequential_init=True,
-    )
+    cfg = SimConfig(N=2, H=4, W=4, C=3, K=2, R=2, S=2, stride=1, pad=0, use_sequential_init=True)
     sim = ImplicitIm2colSystolicSim(cfg)
-
-    print("IFMap (HWC):")
-    print(sim.ifmap)
-    print("\nWeights (R,S,C,K):")
-    print(sim.weights)
-
-    print("\nUnfolded IFMap (channel-first order HF->WF->C):")
-    unfolded = sim.explicit_im2col_channel_first()
-    print(unfolded)
-
-    ofmap, logs = sim.simulate_systolic(trace=True, max_logs=8)
-    print("\nIteration logs (systolic-timed, packed):")
-    for i, entry in enumerate(logs):
-        print(f"iter={i} tiles={entry['tile_rs_group']} out={entry['out_hw']}")
-        for t_idx, tile in enumerate(entry["tile_rs_group"]):
-            print(f"  tile={tile}")
-            print(f"    weight_tile:\n{np.array(entry['weight_tiles'][t_idx])}")
-            print(f"    input_word: {entry['input_words'][t_idx]}")
-            print(f"    partial_sum: {entry['partial_sums'][t_idx]}")
-        print(f"  packed_input: {entry['packed_input']}")
-        print(f"  packed_weight_tile:\n{np.array(entry['packed_weight_tile'])}")
-        print(f"  output_ready_time: {entry['output_ready_time']}")
-        for step in entry["timeline"]:
-            print(f"    t={step['t']} row_inputs={step['row_inputs']} partial_sums={step['partial_sums']}")
-
-    print("\nFinal OFMap (HWC):")
-    print(ofmap)
-
     ref = direct_conv_hwc(sim.ifmap, sim.weights, stride=cfg.stride, pad=cfg.pad)
+    ofmap, step_logs, util_stats = sim.simulate(trace=True, max_logs=6)
+    print(f"Utilization: {util_stats['utilization']:.4f}")
+    print("  total_pe_cycles:", util_stats["total_pe_cycles"], " total_possible:", util_stats["total_possible_pe_cycles"])
+    for i, entry in enumerate(step_logs):
+        print(f"  step {i}: (oh,ow)=({entry['oh']},{entry['ow']}) k={entry['k']} n_rows={entry['n_rows']} n_batch={entry['n_batch']} pe_util={entry['pe_util']:.4f}")
     diff = np.max(np.abs(ref - ofmap))
-    print("\nVerification (direct conv vs sim):")
-    print(f"max_abs_diff={diff}")
-    print("PASS" if diff < 1e-6 else "FAIL")
+    print("Verify:", "PASS" if diff < 1e-6 else "FAIL", f" max_abs_diff={diff}")
 
 
 if __name__ == "__main__":
