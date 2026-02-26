@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from im2col import SYSTOLIC_ARRAY_SIZE, SimConfig, ImplicitIm2colSystolicSim, direct_conv_hwc
+from psum_router import simulate_with_routing, compute_full_timing, PSUMRouter
 
 # Stable color per output channel index for psum bar and writeback table
 def _channel_color(c, cmap_name="tab10"):
@@ -20,8 +21,8 @@ def _list_to_df(rows, columns=None):
     return pd.DataFrame(rows, columns=columns)
 
 
-def _draw_systolic_grid(weight_pad, input_row, psum_row, array_size, n_rows, n_batch, n_start, step_label=""):
-    """Weight tile; input row colored by flattened index; psum row colored by output channel index."""
+def _draw_systolic_grid(weight_pad, input_row, psum_row, array_size, n_rows, n_batch, n_start, cols_label, step_label=""):
+    """Weight tile; input row colored by flattened index; psum row colored by output channel/batch index."""
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
     w = np.array(weight_pad, dtype=float).reshape(array_size, array_size)
     valid = np.isfinite(w)
@@ -29,7 +30,7 @@ def _draw_systolic_grid(weight_pad, input_row, psum_row, array_size, n_rows, n_b
     vmax_w = np.nanmax(w) if np.any(valid) else 1
     im0 = axes[0].imshow(w, cmap="viridis", vmin=vmin_w, vmax=vmax_w)
     axes[0].set_title("1. Weight tile (PE array)")
-    axes[0].set_xlabel("cols = output channels")
+    axes[0].set_xlabel(f"cols = {cols_label}")
     axes[0].set_ylabel("rows = kernel dims (r,s,c)")
     axes[0].set_aspect("equal")
     plt.colorbar(im0, ax=axes[0], label="weight value")
@@ -38,16 +39,26 @@ def _draw_systolic_grid(weight_pad, input_row, psum_row, array_size, n_rows, n_b
     input_idx = np.full((1, array_size), -1, dtype=float)
     for j in range(min(n_rows, array_size)):
         input_idx[0, j] = j
-    cmap_in = plt.get_cmap("viridis", max(1, n_rows))
+    # Use a high-contrast discrete colormap (one distinct hue per index)
+    if n_rows > 0:
+        colors = [plt.cm.hsv(i / max(1, n_rows)) for i in range(n_rows)]
+        cmap_in = mcolors.ListedColormap(colors)
+    else:
+        cmap_in = plt.get_cmap("Greys")
     cmap_in.set_bad(color="lightgray")
-    im1 = axes[1].imshow(np.ma.masked_where(input_idx < 0, input_idx), cmap=cmap_in, vmin=0, vmax=max(1, n_rows - 1))
+    im1 = axes[1].imshow(
+        np.ma.masked_where(input_idx < 0, input_idx),
+        cmap=cmap_in,
+        vmin=-0.5,
+        vmax=max(0.5, n_rows - 0.5),
+    )
     axes[1].set_title("2. Input row (color = flattened index)")
     axes[1].set_xlabel("kernel dim index (r,s,c) order")
     axes[1].set_ylabel("single row")
     axes[1].set_aspect("equal")
     cbar1 = plt.colorbar(im1, ax=axes[1], label="flattened index")
-    if n_rows <= 20:
-        cbar1.set_ticks(range(n_rows))
+    if n_rows <= 20 and n_rows > 0:
+        cbar1.set_ticks(list(range(n_rows)))
 
     # Psum row: color by output channel index (same palette as writeback table: tab10 modulo)
     psum_color_idx = np.full((1, array_size), -1, dtype=float)
@@ -81,7 +92,13 @@ with st.sidebar:
     K = st.number_input("K (Cout)", min_value=1, value=2, step=1)
     R = st.number_input("R (kernel height)", min_value=1, value=3, step=1)
     S = st.number_input("S (kernel width)", min_value=1, value=3, step=1)
-    st.caption(f"Systolic array: {SYSTOLIC_ARRAY_SIZE}×{SYSTOLIC_ARRAY_SIZE} (fixed). Mapping: K-rows / C_out-cols (inference).")
+    mapping_choice = st.selectbox(
+        "Mapping",
+        ["k_rows_n_cols", "batch_parallel"],
+        format_func=lambda x: "K-rows / C_out-cols (inference)" if x == "k_rows_n_cols" else "Batch-parallel (cols=N)",
+        index=0,
+    )
+    st.caption(f"Systolic array: {SYSTOLIC_ARRAY_SIZE}×{SYSTOLIC_ARRAY_SIZE} (fixed).")
     stride = st.number_input("Stride", min_value=1, value=1, step=1)
     pad = st.number_input("Pad", min_value=0, value=0, step=1)
     seed = st.number_input("Seed", min_value=0, value=0, step=1)
@@ -117,8 +134,14 @@ if run:
     else:
         unfolded = None  # too large; Unfolded tab will show message
     ref = direct_conv_hwc(sim.ifmap, sim.weights, stride=cfg.stride, pad=cfg.pad)
-    ofmap, logs, util_stats = sim.simulate(trace=True, max_logs=int(max_logs), mapping="k_rows_n_cols")
+    ofmap, logs, util_stats = sim.simulate(trace=True, max_logs=int(max_logs), mapping=mapping_choice)
     diff = float(np.max(np.abs(ref - ofmap)))
+
+    # PSUM routing & timing (K-rows only for now)
+    routing_result = None
+    if mapping_choice == "k_rows_n_cols":
+        sim_routed = ImplicitIm2colSystolicSim(cfg)
+        routing_result = simulate_with_routing(sim_routed)
 
     st.session_state["sim"] = sim
     st.session_state["unfolded"] = unfolded
@@ -127,6 +150,8 @@ if run:
     st.session_state["ref"] = ref
     st.session_state["diff"] = diff
     st.session_state["util_stats"] = util_stats
+    st.session_state["mapping"] = mapping_choice
+    st.session_state["routing_result"] = routing_result
 
 
 if "sim" in st.session_state:
@@ -139,7 +164,7 @@ if "sim" in st.session_state:
     util_stats = st.session_state.get("util_stats", {})
     sz = SYSTOLIC_ARRAY_SIZE
 
-    tab_names = ["IFMap", "Weights", "Unfolded", "Utilization", "Systolic array", "Iteration", "Output"]
+    tab_names = ["IFMap", "Weights", "Unfolded", "Utilization", "Systolic array", "Iteration", "PSUM Routing", "Output"]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
@@ -166,6 +191,8 @@ if "sim" in st.session_state:
     with tabs[3]:
         st.subheader("Utilization")
         if util_stats:
+            mapping_name = util_stats.get("mapping", "")
+            st.caption(f"Mapping: {'K-rows / C_out-cols' if mapping_name == 'k_rows_n_cols' else 'Batch-parallel'}")
             st.metric("PE utilization", f"{util_stats.get('utilization', 0):.2%}")
             st.write("Total PE cycles (active):", util_stats.get("total_pe_cycles", 0))
             st.write("Total possible PE cycles:", util_stats.get("total_possible_pe_cycles", 0))
@@ -194,14 +221,23 @@ if "sim" in st.session_state:
                     st.caption("1 step logged (use slider when more steps are available).")
             entry = logs[int(step_idx)]
             n_rows, n_batch = entry["n_rows"], entry["n_batch"]
+            is_k_rows = "k_start" in entry
             n_start = entry.get("n_start", 0)
             tl = entry.get("timeline", [])
-            row_inputs = tl[0]["row_inputs"][:sz] if tl else [0.0] * sz
-            psum_row = tl[0]["partial_sums"][:sz] if tl else [0.0] * sz
+            # For now, always show the first logged cycle for this step.
+            cycle_idx = 0
+            row_inputs = tl[0]["row_inputs"][:sz] if tl else ([0.0] * sz)
+            psum_row = tl[0]["partial_sums"][:sz] if tl else ([0.0] * sz)
             if len(psum_row) < sz:
                 psum_row = list(psum_row) + [np.nan] * (sz - len(psum_row))
             weight_pad = np.full((sz, sz), np.nan, dtype=float)
             weight_pad[:n_rows, :n_batch] = entry["weight_block"]
+            step_label = (
+                f"Step {step_idx} (oh,ow)=({entry.get('oh', 0)},{entry.get('ow', 0)}) "
+                + (f"k_start={entry.get('k_start')} n_start={n_start} |" if is_k_rows else f"k={entry.get('k')} batch_start={entry.get('batch_start')} row_start={entry.get('row_start')} |")
+                + f" n_rows={n_rows} n_cols={n_batch} | pe_util={entry.get('pe_util', 0):.2%}"
+            )
+            cols_label = "output channels (C_out)" if is_k_rows else "batch (N)"
             fig = _draw_systolic_grid(
                 weight_pad.flatten().tolist(),
                 row_inputs,
@@ -210,41 +246,90 @@ if "sim" in st.session_state:
                 n_rows,
                 n_batch,
                 n_start,
-                step_label=f"Step {step_idx} (oh,ow)=({entry.get('oh', 0)},{entry.get('ow', 0)}) k_start={entry.get('k_start', entry.get('k', 0))} n_start={n_start} | n_rows={n_rows} n_cols={n_batch} | pe_util={entry.get('pe_util', 0):.2%}",
+                cols_label,
+                step_label=step_label,
             )
             st.pyplot(fig)
             plt.close()
 
+            # Index mapping for this step
+            st.markdown("**Index mapping for this step**")
+            idx_col, col_col = st.columns(2)
+            cfg = sim.cfg
+            base_row_idx = entry.get('k_start', entry.get('row_start', 0))
+            with idx_col:
+                st.caption("Input / kernel rows → (r,s,c) (flattened index)")
+                idx_rows = []
+                span = cfg.S * cfg.C
+                for local_idx in range(n_rows):
+                    flat_idx = base_row_idx + local_idx
+                    r = flat_idx // span
+                    rem = flat_idx % span
+                    s = rem // cfg.C
+                    c = rem % cfg.C
+                    idx_rows.append({"flat_idx": flat_idx, "r": r, "s": s, "c": c})
+                st.dataframe(pd.DataFrame(idx_rows))
+            with col_col:
+                if is_k_rows:
+                    st.caption("Weight columns → C_out indices for this tile")
+                    col_rows = [{"local_col": j, "C_out": n_start + j} for j in range(n_batch)]
+                else:
+                    batch_start = entry.get('batch_start', 0)
+                    st.caption("Weight columns → batch indices for this tile")
+                    col_rows = [{"local_col": j, "batch": batch_start + j} for j in range(n_batch)]
+                st.dataframe(pd.DataFrame(col_rows))
+
             st.markdown("---")
             st.subheader("Psum writeback")
-            n_b = entry.get("n_b", 0)
             oh, ow = entry.get("oh", 0), entry.get("ow", 0)
             psums = entry.get("partial_sums", [])
-            st.markdown(f"**This step accumulates into:** `OFMap[batch={n_b}, oh={oh}, ow={ow}, channels {n_start}:{n_start + len(psums)}]`")
-            st.markdown("Operation: `OFMap[n_b, oh, ow, n_start:n_end] += partial_sums` (add these values to existing partial sums from previous K-tiles).")
-            ofmap_ho, ofmap_wo, ofmap_k = ofmap.shape[1], ofmap.shape[2], ofmap.shape[3]
-            ofmap_spatial = ofmap[n_b, :, :, 0]
-            fig2, ax = plt.subplots(figsize=(2, 2))
-            ax.imshow(ofmap_spatial, cmap="gray")
-            ax.plot(ow, oh, "ro", markersize=6, fillstyle="none", markeredgewidth=2, label=f"({oh},{ow})")
-            ax.set_xlabel("ow")
-            ax.set_ylabel("oh")
-            ax.set_title(f"Writeback (oh,ow)=({oh},{ow})")
-            ax.legend(fontsize=6)
-            ax.tick_params(axis="both", labelsize=6)
-            col1, _ = st.columns([1, 3])
-            with col1:
-                st.pyplot(fig2)
-            plt.close()
-            ch_end = min(n_start + len(psums), ofmap_k)
-            st.write("Channel slice updated this step (C_out indices", n_start, "..", ch_end - 1, "); colors match psum bar above:")
-            df_psum = pd.DataFrame(np.array(psums).reshape(1, -1), columns=[n_start + j for j in range(len(psums))])
-            st.dataframe(
-                df_psum.style.apply(
-                    lambda row: [f"background-color: {_channel_color(n_start + j)}" for j in range(len(row))],
-                    axis=1,
+            if is_k_rows:
+                n_b = entry.get("n_b", 0)
+                st.markdown(f"**This step accumulates into:** `OFMap[batch={n_b}, oh={oh}, ow={ow}, channels {n_start}:{n_start + len(psums)}]`")
+                st.markdown("Operation: `OFMap[n_b, oh, ow, n_start:n_end] += partial_sums` (add these values to existing partial sums from previous K-tiles).")
+                ofmap_spatial = ofmap[n_b, :, :, 0]
+                fig2, ax = plt.subplots(figsize=(2, 2))
+                ax.imshow(ofmap_spatial, cmap="gray")
+                ax.plot(ow, oh, "ro", markersize=6, fillstyle="none", markeredgewidth=2, label=f"({oh},{ow})")
+                ax.set_xlabel("ow")
+                ax.set_ylabel("oh")
+                ax.set_title(f"Writeback (oh,ow)=({oh},{ow})")
+                ax.legend(fontsize=6)
+                ax.tick_params(axis="both", labelsize=6)
+                col1, _ = st.columns([1, 3])
+                with col1:
+                    st.pyplot(fig2)
+                plt.close()
+                ofmap_k = ofmap.shape[3]
+                ch_end = min(n_start + len(psums), ofmap_k)
+                st.write("Channel slice updated this step (C_out indices", n_start, "..", ch_end - 1, "); colors match psum bar above:")
+                df_psum = pd.DataFrame(np.array(psums).reshape(1, -1), columns=[n_start + j for j in range(len(psums))])
+                st.dataframe(
+                    df_psum.style.apply(
+                        lambda row: [f"background-color: {_channel_color(n_start + j)}" for j in range(len(row))],
+                        axis=1,
+                    )
                 )
-            )
+            else:
+                batch_start = entry.get("batch_start", 0)
+                batch_end = batch_start + len(psums)
+                k_out = entry.get("k", 0)
+                st.markdown(f"**This step accumulates into:** `OFMap[batch={batch_start}:{batch_end}, oh={oh}, ow={ow}, channel k={k_out}]`")
+                st.markdown("Operation: one PSUM per batch index; `OFMap[n, oh, ow, k] += partial_sums[n-batch_start]`.")
+                ofmap_spatial = ofmap[min(batch_start, ofmap.shape[0] - 1), :, :, k_out]
+                fig2, ax = plt.subplots(figsize=(2, 2))
+                ax.imshow(ofmap_spatial, cmap="gray")
+                ax.plot(ow, oh, "ro", markersize=6, fillstyle="none", markeredgewidth=2, label=f"({oh},{ow})")
+                ax.set_xlabel("ow")
+                ax.set_ylabel("oh")
+                ax.set_title(f"Writeback (oh,ow)=({oh},{ow}) k={k_out}")
+                ax.legend(fontsize=6)
+                ax.tick_params(axis="both", labelsize=6)
+                col1, _ = st.columns([1, 3])
+                with col1:
+                    st.pyplot(fig2)
+                plt.close()
+                st.write("PSUMs (one per batch index):", psums)
         else:
             st.info("Run simulation to see systolic grid.")
 
@@ -274,6 +359,94 @@ if "sim" in st.session_state:
                 st.write(entry)
 
     with tabs[6]:
+        st.subheader("PSUM Buffer Routing & Timing")
+        routing_result = st.session_state.get("routing_result")
+        if routing_result is None:
+            st.info("PSUM routing is available for K-rows / C_out-cols mapping. Select that mapping and run.")
+        else:
+            tm = routing_result["timing"]
+            router = routing_result["router"]
+
+            st.markdown(f"**Routing verification:** {'PASS' if routing_result['verified'] else 'FAIL'} "
+                        f"(max abs diff = {routing_result['max_abs_diff']:.2e})")
+
+            st.markdown("### Cycle Budget")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("Total cycles", f"{tm['total_cycles']:,}")
+                st.write(f"Tiles: {tm['num_k_tiles']} K × {tm['num_n_tiles']} C_out × {tm['num_m_tiles']} spatial")
+            with col_b:
+                phases = {
+                    "Weight load": tm["weight_load_total"],
+                    "Fill (pipeline)": tm["fill_total"],
+                    "Compute (MAC)": tm["compute_total"],
+                    "Drain (pipeline)": tm["drain_total"],
+                    "Buffer drain → VREG": tm["buffer_drain_total"],
+                }
+                st.dataframe(pd.DataFrame([
+                    {"Phase": k, "Cycles": v, "% of total": f"{100*v/tm['total_cycles']:.1f}%"}
+                    for k, v in phases.items()
+                ]))
+
+            st.markdown("### Phase Breakdown (stacked bar)")
+            fig_bar, ax_bar = plt.subplots(figsize=(8, 3))
+            phase_names = list(phases.keys())
+            phase_vals = list(phases.values())
+            colors_bar = ["#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2"]
+            left = 0
+            for name, val, c in zip(phase_names, phase_vals, colors_bar):
+                ax_bar.barh(0, val, left=left, color=c, label=f"{name} ({val})")
+                left += val
+            ax_bar.set_xlabel("Cycles")
+            ax_bar.set_yticks([])
+            ax_bar.legend(fontsize=7, loc="upper right")
+            ax_bar.set_title(f"Total: {tm['total_cycles']:,} cycles")
+            plt.tight_layout()
+            st.pyplot(fig_bar)
+            plt.close()
+
+            st.markdown("### Per-Tile Timing")
+            tile_rows = []
+            for i, tt in enumerate(tm["tiles"]):
+                tile_rows.append({
+                    "#": i,
+                    "k_start": tt.k_start,
+                    "n_start": tt.n_start,
+                    "m_start": tt.m_start,
+                    "k_tile": tt.k_tile,
+                    "n_tile": tt.n_tile,
+                    "m_count": tt.m_count,
+                    "wt_load": tt.weight_load_cycles,
+                    "fill": tt.fill_cycles,
+                    "compute": tt.compute_cycles,
+                    "drain": tt.drain_cycles,
+                    "buf_drain": tt.buffer_drain_cycles,
+                    "total": tt.total_cycles,
+                })
+            st.dataframe(pd.DataFrame(tile_rows))
+
+            with st.expander("PSUM Routing Architecture", expanded=False):
+                st.markdown("""
+**Direct-mapped routing:** `column c → buffer c` (no crossbar needed).
+
+**Why this works (proof of conflict-freedom):**
+1. Each cycle, columns 0–31 output simultaneously (`value_ready` in RTL).
+2. `buffer_index = column_index` → all 32 targets are distinct per cycle.
+3. K-tile accumulation: same column always maps to same buffer, so partial sums accumulate correctly across K-tiles.
+4. C_out tile reuse: after all K-tiles drain, buffers are reset and reused for next C_out tile.
+
+**Timing per tile:** `weight_load (32) + fill (2) + compute (M) + drain (2) + buffer_drain (M)`
+
+The fill/drain are the pipeline depth from Raphael's RTL (`value_ready` is 2 cycles after `start`).
+                """)
+
+            with st.expander("Route Log (first 50 events)"):
+                if router.route_log:
+                    st.dataframe(pd.DataFrame(router.route_log[:50]))
+                else:
+                    st.write("No route events logged.")
+
+    with tabs[7]:
         st.subheader("Output")
         st.write("OFMap (HWC), channel 0:")
         st.dataframe(_array_to_df(ofmap[0, :, :, 0]))

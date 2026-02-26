@@ -123,10 +123,6 @@ class ImplicitIm2colSystolicSim:
         return out
 
     def simulate(self, trace=True, max_logs=None, mapping=None):
-        """
-        Run convolution on 32×32 array. Default: k_rows_n_cols (inference-optimized).
-        Pass mapping='batch_parallel' to use batch-parallel columns. Returns ofmap, step_logs, util_stats.
-        """
         if mapping is None:
             mapping = "k_rows_n_cols"
         if mapping == "k_rows_n_cols":
@@ -212,8 +208,8 @@ class ImplicitIm2colSystolicSim:
 
     def simulate_k_rows_n_cols(self, trace=True, max_logs=None):
         """
-        K-rows, C_out-cols (weight-stationary). K tiling + N (C_out) tiling + output spatial tiling.
-        Rows = kernel dims, cols = output channels; M = N*Ho*Wo streamed in spatial tiles.
+        K tiling + N (C_out) tiling + output spatial tiling
+        Rows = kernel dims, cols = output channels; M = N*Ho*Wo streamed in spatial tiles
         """
         cfg = self.cfg
         self.ofmap = np.zeros((cfg.N, self.Ho, self.Wo, cfg.K), dtype=float)
@@ -276,7 +272,7 @@ class ImplicitIm2colSystolicSim:
 
 
 def utilization_batch_parallel(cfg: SimConfig):
-    """PE utilization if we map rows=kernel, cols=batch. No sim, just math."""
+    """map rows=kernel, cols=batch"""
     K_flat = cfg.R * cfg.S * cfg.C
     Ho = (cfg.H + 2 * cfg.pad - cfg.R) // cfg.stride + 1
     Wo = (cfg.W + 2 * cfg.pad - cfg.S) // cfg.stride + 1
@@ -286,16 +282,17 @@ def utilization_batch_parallel(cfg: SimConfig):
         for _ow in range(Wo):
             for _k in range(cfg.K):
                 for batch_start in range(0, cfg.N, sz):
-                    n_batch = min(sz, cfg.N - batch_start)
+                    n_batch = min(sz, cfg.N - batch_start) # active cols (batch)
                     for row_start in range(0, K_flat, sz):
-                        n_rows = min(sz, K_flat - row_start)
+                        n_rows = min(sz, K_flat - row_start) # active rows (kernel)
                         total_pe += n_rows * n_batch
                         total_possible += sz * sz
     return (total_pe / total_possible) if total_possible else 0, total_pe, total_possible
 
-
+""" k rows/cout cols = (R*S*Cin / ([R * S * Cin / Sz] * Sz)) * Cout / ([Cout / Sz] * Sz)
+    batch parallel = (R*S*Cin / ([R * S * Cin / Sz] * Sz)) * N / ([N / Sz] * Sz)"""
 def utilization_k_rows_n_cols(cfg: SimConfig):
-    """PE utilization if we map rows=kernel, cols=C_out (output channels). Standard WS. No sim."""
+    """map rows=kernel, cols=C_out """
     K_flat = cfg.R * cfg.S * cfg.C
     Ho = (cfg.H + 2 * cfg.pad - cfg.R) // cfg.stride + 1
     Wo = (cfg.W + 2 * cfg.pad - cfg.S) // cfg.stride + 1
@@ -304,16 +301,16 @@ def utilization_k_rows_n_cols(cfg: SimConfig):
     sz = SYSTOLIC_ARRAY_SIZE
     total_pe, total_possible = 0, 0
     for k_start in range(0, K_flat, sz):
-        k_tile = min(sz, K_flat - k_start)
+        k_tile = min(sz, K_flat - k_start) # active rows per k tile
         for n_start in range(0, N_out, sz):
-            n_tile = min(sz, N_out - n_start)
+            n_tile = min(sz, N_out - n_start) # active cols per c out tile
             total_pe += M * (k_tile * n_tile)
             total_possible += M * (sz * sz)
     return (total_pe / total_possible) if total_possible else 0, total_pe, total_possible
 
 
 def best_mapping(cfg: SimConfig):
-    """Return ('batch_parallel'|'k_rows_n_cols', util). Picks higher utilization."""
+    """picks best of batch_parallel|k_rows_n_cols"""
     u_bp, _, _ = utilization_batch_parallel(cfg)
     u_kn, _, _ = utilization_k_rows_n_cols(cfg)
     if u_kn >= u_bp:
