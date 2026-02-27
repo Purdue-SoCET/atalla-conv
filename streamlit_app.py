@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from im2col import SYSTOLIC_ARRAY_SIZE, SimConfig, ImplicitIm2colSystolicSim, direct_conv_hwc
-from psum_router import simulate_with_routing, compute_full_timing, PSUMRouter
+from psum_router import simulate_with_routing
 
 # Stable color per output channel index for psum bar and writeback table
 def _channel_color(c, cmap_name="tab10"):
@@ -166,6 +166,7 @@ if "sim" in st.session_state:
 
     tab_names = ["IFMap", "Weights", "Unfolded", "Utilization", "Systolic array", "Iteration", "PSUM Routing", "Output"]
     tabs = st.tabs(tab_names)
+    routing_result = st.session_state.get("routing_result")
 
     with tabs[0]:
         st.subheader("IFMap (HWC)")
@@ -359,92 +360,26 @@ if "sim" in st.session_state:
                 st.write(entry)
 
     with tabs[6]:
-        st.subheader("PSUM Buffer Routing & Timing")
-        routing_result = st.session_state.get("routing_result")
+        st.subheader("PSUM Buffer Routing")
         if routing_result is None:
             st.info("PSUM routing is available for K-rows / C_out-cols mapping. Select that mapping and run.")
         else:
-            tm = routing_result["timing"]
-            router = routing_result["router"]
-
             st.markdown(f"**Routing verification:** {'PASS' if routing_result['verified'] else 'FAIL'} "
                         f"(max abs diff = {routing_result['max_abs_diff']:.2e})")
 
-            st.markdown("### Cycle Budget")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("Total cycles", f"{tm['total_cycles']:,}")
-                st.write(f"Tiles: {tm['num_k_tiles']} K × {tm['num_n_tiles']} C_out × {tm['num_m_tiles']} spatial")
-            with col_b:
-                phases = {
-                    "Weight load": tm["weight_load_total"],
-                    "Fill (pipeline)": tm["fill_total"],
-                    "Compute (MAC)": tm["compute_total"],
-                    "Drain (pipeline)": tm["drain_total"],
-                    "Buffer drain → VREG": tm["buffer_drain_total"],
-                }
-                st.dataframe(pd.DataFrame([
-                    {"Phase": k, "Cycles": v, "% of total": f"{100*v/tm['total_cycles']:.1f}%"}
-                    for k, v in phases.items()
-                ]))
-
-            st.markdown("### Phase Breakdown (stacked bar)")
-            fig_bar, ax_bar = plt.subplots(figsize=(8, 3))
-            phase_names = list(phases.keys())
-            phase_vals = list(phases.values())
-            colors_bar = ["#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2"]
-            left = 0
-            for name, val, c in zip(phase_names, phase_vals, colors_bar):
-                ax_bar.barh(0, val, left=left, color=c, label=f"{name} ({val})")
-                left += val
-            ax_bar.set_xlabel("Cycles")
-            ax_bar.set_yticks([])
-            ax_bar.legend(fontsize=7, loc="upper right")
-            ax_bar.set_title(f"Total: {tm['total_cycles']:,} cycles")
-            plt.tight_layout()
-            st.pyplot(fig_bar)
-            plt.close()
-
-            st.markdown("### Per-Tile Timing")
-            tile_rows = []
-            for i, tt in enumerate(tm["tiles"]):
-                tile_rows.append({
-                    "#": i,
-                    "k_start": tt.k_start,
-                    "n_start": tt.n_start,
-                    "m_start": tt.m_start,
-                    "k_tile": tt.k_tile,
-                    "n_tile": tt.n_tile,
-                    "m_count": tt.m_count,
-                    "wt_load": tt.weight_load_cycles,
-                    "fill": tt.fill_cycles,
-                    "compute": tt.compute_cycles,
-                    "drain": tt.drain_cycles,
-                    "buf_drain": tt.buffer_drain_cycles,
-                    "total": tt.total_cycles,
-                })
-            st.dataframe(pd.DataFrame(tile_rows))
-
-            with st.expander("PSUM Routing Architecture", expanded=False):
+            with st.expander("Routing Algorithm", expanded=True):
                 st.markdown("""
 **Direct-mapped routing:** `column c → buffer c` (no crossbar needed).
 
-**Why this works (proof of conflict-freedom):**
-1. Each cycle, columns 0–31 output simultaneously (`value_ready` in RTL).
-2. `buffer_index = column_index` → all 32 targets are distinct per cycle.
-3. K-tile accumulation: same column always maps to same buffer, so partial sums accumulate correctly across K-tiles.
-4. C_out tile reuse: after all K-tiles drain, buffers are reset and reused for next C_out tile.
+**Conflict-freedom:** Each output cycle, columns 0–31 produce values simultaneously.
+`buffer_index = column_index` → all 32 targets are distinct. No conflicts, ever.
 
-**Timing per tile:** `weight_load (32) + fill (2) + compute (M) + drain (2) + buffer_drain (M)`
+**K-tile accumulation:** Same column always maps to same buffer. Partial sums from
+successive K-tiles accumulate in-place. After all K-tiles for a C_out tile: drain to VREGs.
 
-The fill/drain are the pipeline depth from Raphael's RTL (`value_ready` is 2 cycles after `start`).
+**Loop ordering (critical):** C_out tiles outer, K tiles inner — so all K-tile partials
+accumulate in the same buffer set before draining.
                 """)
-
-            with st.expander("Route Log (first 50 events)"):
-                if router.route_log:
-                    st.dataframe(pd.DataFrame(router.route_log[:50]))
-                else:
-                    st.write("No route events logged.")
 
     with tabs[7]:
         st.subheader("Output")
